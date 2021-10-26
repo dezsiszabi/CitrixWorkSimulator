@@ -1,9 +1,6 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 
 namespace CitrixWorkSimulator
 {
@@ -142,7 +139,7 @@ namespace CitrixWorkSimulator
                         if (!_stop.WaitOne(0))
                         {
                             _stop.Set();
-                        } 
+                        }
                         else
                         {
                             _stop = new ManualResetEvent(false);
