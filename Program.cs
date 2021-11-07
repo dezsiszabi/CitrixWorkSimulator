@@ -1,191 +1,135 @@
-﻿using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Text;
+﻿using Microsoft.Win32;
+using System.Timers;
 
 namespace CitrixWorkSimulator
 {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT
-    {
-        public int X;
-        public int Y;
-
-        public POINT(int x, int y)
-        {
-            X = x;
-            Y = y;
-        }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT
-    {
-        public int Left, Top, Right, Bottom;
-
-        public RECT(int left, int top, int right, int bottom)
-        {
-            Left = left;
-            Top = top;
-            Right = right;
-            Bottom = bottom;
-        }
-
-        public int X
-        {
-            get { return Left; }
-            set { Right -= (Left - value); Left = value; }
-        }
-
-        public int Y
-        {
-            get { return Top; }
-            set { Bottom -= (Top - value); Top = value; }
-        }
-
-        public int Height
-        {
-            get { return Bottom - Top; }
-            set { Bottom = value + Top; }
-        }
-
-        public int Width
-        {
-            get { return Right - Left; }
-            set { Right = value + Left; }
-        }
-    }
-
     class Program
     {
-        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        private static WFICALib.ICAClientClass? _icaClient = null;
+        private static bool _isSendingKeys = false;
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+        private static int _enumHandle;
+        private static string? _sessionId;
+        
+        private static System.Timers.Timer _timer = new System.Timers.Timer(1_000);
 
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        static extern bool GetCursorPos(out POINT lpPoint);
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        static extern bool SetCursorPos(int x, int y);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr SetCapture(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr SetActiveWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr SetFocus(IntPtr hWnd);
-
-        public const int WM_KEYDOWN = 0x0100;
-        public const int WM_KEYUP = 0x0101;
-        public const int WM_CHAR = 0x0102;
-        public const int WM_MOUSEMOVE = 0x0200;
-        public const int WM_LBUTTONDOWN = 0x0201;
-        public const int WM_LBUTTONUP = 0x0202;
-
-        private static List<(string ClassName, IntPtr Handle)> _childWindows = new List<(string ClassName, IntPtr Handle)>();
-        private static RegisteredWaitHandle _clicker;
-        private static ManualResetEvent _stop;
-
-        static void Main()
+        static void Main(string[] args)
         {
-            var processes = Process.GetProcessesByName("CDViewer");
-
-            if (processes.Length == 0)
+            if (!OperatingSystem.IsWindows())
             {
-                Console.WriteLine("CDViewer is not running! Exiting.");
+                Console.WriteLine("ERROR: Only Windows platform is supported! Exiting...");
                 return;
             }
 
-            var citrixMainWindowHandle = processes[0].MainWindowHandle;
+            var subkey = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM", false);
 
-            EnumChildWindows(citrixMainWindowHandle, Proc, IntPtr.Zero);
-
-            var idx = _childWindows.FindIndex(elem => elem.ClassName == "CtxICADisp");
-
-            if (idx == -1)
+            if (subkey == null)
             {
-                Console.WriteLine("Child window with class CtxICADisp was not found! Exiting.");
+                Console.WriteLine(@"ERROR: HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM doesn't exist! Exiting...");
                 return;
             }
 
-            var ctxIcaWindowHandle = _childWindows[idx].Handle;
+            var allowSimulationApiValue = subkey.GetValue("AllowSimulationAPI");
 
-            Console.WriteLine("Starting click simulation... Press Ctrl+C to exit.");
-
-            _stop = new ManualResetEvent(false);
-            _clicker = ThreadPool.RegisterWaitForSingleObject(_stop, new WaitOrTimerCallback(ThreadFunc), ctxIcaWindowHandle, 1000, false);
-
-            ConsoleKeyInfo key;
-
-            while ((key = Console.ReadKey()).Key != ConsoleKey.Q)
+            if (allowSimulationApiValue == null)
             {
-                switch (key.Key)
-                {
+                Console.WriteLine(@"ERROR: HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM\AllowSimulationAPI doesn't exist! Exiting...");
+                return;
+            }
+
+            if (allowSimulationApiValue is not int || (int)allowSimulationApiValue != 1)
+            {
+                Console.WriteLine(@"ERROR: HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM\AllowSimulationAPI has to be a DWORD with value 1! Exiting...");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                Console.WriteLine("ERROR: No .ica path was provided! Exiting...");
+                return;
+            }
+
+            var icaPath = args[0];
+
+            if (!File.Exists(icaPath))
+            {
+                Console.WriteLine("ERROR: The .ica file provided doesn't exist! Exiting...");
+                return;
+            }
+
+            _timer.Elapsed += SimulationLoop;
+
+            _icaClient = new WFICALib.ICAClientClass();
+            _icaClient.CacheICAFile = false;
+            _icaClient.ICAFile = Path.GetFullPath(icaPath);
+            _icaClient.OutputMode = WFICALib.OutputMode.OutputModeNormal;
+            _icaClient.Launch = true;
+            _icaClient.TWIMode = true;
+
+            _icaClient.OnConnect += IcaClient_OnConnect;
+
+            _icaClient.Connect();
+
+            ConsoleKeyInfo? key = null;
+
+            Console.WriteLine("Press Escape to exit the program");
+            Console.WriteLine("Press Space to start/pause the simulation (currently paused)");
+            Console.WriteLine("Press Up/Down to change the simulation interval (currently 1000 ms)");
+
+            do
+            {
+                key = Console.ReadKey();
+                switch (key.Value.Key) {
                     case ConsoleKey.Spacebar:
-                        if (!_stop.WaitOne(0))
                         {
-                            _stop.Set();
+                            _isSendingKeys = !_isSendingKeys;
+
+                            if (_isSendingKeys)
+                            {
+                                Console.WriteLine("Simulation started...");
+                                _timer.Start();
+                            }
+                            else
+                            {
+                                Console.WriteLine("Simulation stopped...");
+                                _timer.Stop();
+                            }
+                            break;
                         }
-                        else
+                    case ConsoleKey.UpArrow:
                         {
-                            _stop = new ManualResetEvent(false);
-                            _clicker = ThreadPool.RegisterWaitForSingleObject(_stop, new WaitOrTimerCallback(ThreadFunc), ctxIcaWindowHandle, 1000, false);
+                            _timer.Interval = Math.Min(_timer.Interval + 1000, 60_000);
+                            Console.WriteLine($"Interval set to: {_timer.Interval} ms");
+                            break;
                         }
-                        break;
+                    case ConsoleKey.DownArrow:
+                        {
+                            _timer.Interval = Math.Max(_timer.Interval - 1000, 1_000);
+                            Console.WriteLine($"Interval set to: {_timer.Interval} ms");
+                            break;
+                        }
                 }
-            }
+            } while (key?.Key != ConsoleKey.Escape);
+
+            _timer.Stop();
+            _timer.Elapsed -= SimulationLoop;
+            _timer.Dispose();
+
+            _icaClient.StopMonitoringCCMSession(_sessionId);
+            _icaClient.CloseEnumHandle(_enumHandle);
         }
 
-        static void ThreadFunc(object state, bool timedOut)
+        private static void IcaClient_OnConnect()
         {
-            if (timedOut)
-            {
-                var ctxIcaWindowHandle = (IntPtr)state;
-
-                RECT r;
-                GetWindowRect(ctxIcaWindowHandle, out r);
-
-                POINT p;
-                GetCursorPos(out p);
-
-                SetCursorPos((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
-
-                SendMessage(ctxIcaWindowHandle, WM_LBUTTONDOWN, IntPtr.Zero, new IntPtr(MAKELPARAM(0, 300)));
-                SendMessage(ctxIcaWindowHandle, WM_LBUTTONUP, IntPtr.Zero, new IntPtr(MAKELPARAM(0, 300)));
-
-                SetCursorPos(p.X, p.Y);
-            }
-            else
-            {
-                _clicker.Unregister(null);
-            }
+            _enumHandle = _icaClient!.EnumerateCCMSessions();
+            _sessionId = _icaClient!.GetEnumNameByIndex(_enumHandle, 0);
+            _icaClient.StartMonitoringCCMSession(_sessionId, true);
         }
 
-        private static bool Proc(IntPtr hWnd, IntPtr lParam)
+        private static void SimulationLoop(object? sender, ElapsedEventArgs e)
         {
-            StringBuilder className = new StringBuilder(256);
-            GetClassName(hWnd, className, className.Capacity);
-            _childWindows.Add((className.ToString(), hWnd));
-            return true;
-        }
-
-        private static int MAKELPARAM(int x, int y)
-        {
-            return (y << 16) | (x & 0xFFFF);
+            _icaClient!.Session.Keyboard.SendKeyDown(65);
+            _icaClient!.Session.Keyboard.SendKeyUp(65);
         }
     }
 }

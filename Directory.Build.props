@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <WFICALibPath>C:\Program Files (x86)\Citrix\ICA Client</WFICALibPath>
+  </PropertyGroup>
+</Project>
